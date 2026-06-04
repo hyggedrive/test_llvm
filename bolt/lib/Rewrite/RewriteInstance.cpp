@@ -322,15 +322,40 @@ RewriteInstance::RewriteInstance(ELFObjectFileBase *File, const int Argc,
     : InputFile(File), Argc(Argc), Argv(Argv), ToolPath(ToolPath),
       SHStrTab(StringTableBuilder::ELF) {
   ErrorAsOutParameter EAO(&Err);
-  auto ELF64LEFile = dyn_cast<ELF64LEObjectFile>(InputFile);
+  /*auto ELF64LEFile = dyn_cast<ELF64LEObjectFile>(InputFile);
   if (!ELF64LEFile) {
     Err = createStringError(errc::not_supported,
                             "Only 64-bit LE ELF binaries are supported");
     return;
   }
-
+  
   bool IsPIC = false;
-  const ELFFile<ELF64LE> &Obj = ELF64LEFile->getELFFile();
+  const ELFFile<ELF64LE> &Obj = ELF64LEFile->getELFFile();*///zgq
+  
+  //zgq
+  bool IsPIC = false;
+  auto ELF32LEFile = dyn_cast<ELF32LEObjectFile>(InputFile);
+
+  const ELFFile<ELF32LE> &Obj = ELF32LEFile->getELFFile();
+if (auto *ELF32LEFile = dyn_cast<ELF32LEObjectFile>(InputFile)) {
+  const auto &Obj = ELF32LEFile->getELFFile();
+
+  if (Obj.getHeader().e_type != ELF::ET_EXEC)
+    IsPIC = true;
+
+} else if (auto *ELF64LEFile = dyn_cast<ELF64LEObjectFile>(InputFile)) {
+  const auto &Obj = ELF64LEFile->getELFFile();
+
+  if (Obj.getHeader().e_type != ELF::ET_EXEC)
+    IsPIC = true;
+
+} else {
+  Err = createStringError(errc::not_supported,
+                          "Only LE ELF binaries are supported");
+  return;
+}
+  //zgq
+
   if (Obj.getHeader().e_type != ELF::ET_EXEC) {
     outs() << "BOLT-INFO: shared object or position-independent executable "
               "detected\n";
@@ -437,7 +462,7 @@ static bool checkVMA(const typename ELFT::Phdr &Phdr,
   return false;
 }
 
-void RewriteInstance::markGnuRelroSections() {
+/*void RewriteInstance::markGnuRelroSections() {
   using ELFT = ELF64LE;
   using ELFShdrTy = typename ELFObjectFile<ELFT>::Elf_Shdr;
   auto ELF64LEFile = cast<ELF64LEObjectFile>(InputFile);
@@ -477,9 +502,251 @@ void RewriteInstance::markGnuRelroSections() {
     if (Phdr.p_type == ELF::PT_GNU_RELRO)
       for (SectionRef SecRef : InputFile->sections())
         handleSection(Phdr, SecRef);
+}*///zgq
+
+//zgq
+template <typename ELFT>
+void RewriteInstance::markGnuRelroSectionsImpl(
+    ELFObjectFile<ELFT> *File) {
+
+  using ELFShdrTy =
+      typename ELFObjectFile<ELFT>::Elf_Shdr;
+
+  const ELFFile<ELFT> &Obj =
+      File->getELFFile();
+
+  auto handleSection = [&](const typename ELFT::Phdr &Phdr,
+                           SectionRef SecRef) {
+
+    BinarySection *BinarySection =
+        BC->getSectionForSectionRef(SecRef);
+
+    if (!BinarySection || !BinarySection->isAllocatable())
+      return;
+
+    const ELFShdrTy *Sec =
+        cantFail(Obj.getSection(SecRef.getIndex()));
+
+    bool ImageOverlap{false};
+    bool VMAOverlap{false};
+
+    bool ImageContains =
+        checkOffsets<ELFT>(Phdr, *Sec, ImageOverlap);
+
+    bool VMAContains =
+        checkVMA<ELFT>(Phdr, *Sec, VMAOverlap);
+
+    if (ImageOverlap) {
+      if (opts::Verbosity >= 1)
+        errs() << "BOLT-WARNING: GNU_RELRO segment has partial file offset "
+               << "overlap with section " << BinarySection->getName() << '\n';
+      return;
+    }
+    if (VMAOverlap) {
+      if (opts::Verbosity >= 1)
+        errs() << "BOLT-WARNING: GNU_RELRO segment has partial VMA overlap "
+               << "with section " << BinarySection->getName() << '\n';
+      return;
+    }
+    if (!ImageContains || !VMAContains)
+      return;
+    BinarySection->setRelro();
+    if (opts::Verbosity >= 1)
+      outs() << "BOLT-INFO: marking " << BinarySection->getName()
+             << " as GNU_RELRO\n";
+  };
+
+  for (const auto &Phdr : cantFail(Obj.program_headers()))
+    if (Phdr.p_type == ELF::PT_GNU_RELRO)
+      for (SectionRef SecRef : InputFile->sections())
+        handleSection(Phdr, SecRef);
 }
 
+void RewriteInstance::markGnuRelroSections() {
+
+  if (auto *F =
+      dyn_cast<ELF32LEObjectFile>(InputFile))
+    return markGnuRelroSectionsImpl(F);
+
+  if (auto *F =
+      dyn_cast<ELF64LEObjectFile>(InputFile))
+    return markGnuRelroSectionsImpl(F);
+
+  llvm_unreachable("unsupported ELF");
+}
+//zgq
+
+//zgq
+template <typename ELFT>
+Error RewriteInstance::discoverStorage(ELFObjectFile<ELFT> *File) {
+  const ELFFile<ELFT> &Obj = File->getELFFile();
+
+  using Elf_Phdr = typename ELFFile<ELFT>::Elf_Phdr;
+
+  BC->StartFunctionAddress = Obj.getHeader().e_entry;
+
+  NextAvailableAddress = 0;
+  uint64_t NextAvailableOffset = 0;
+
+  auto PHsOrErr = Obj.program_headers();
+  if (Error E = PHsOrErr.takeError())
+    return E;
+
+  auto PHs = PHsOrErr.get();
+
+  for (const Elf_Phdr &Phdr : PHs) {
+     switch (Phdr.p_type) {
+    case ELF::PT_LOAD:
+      BC->FirstAllocAddress = std::min(BC->FirstAllocAddress,
+                                       static_cast<uint64_t>(Phdr.p_vaddr));
+      /*NextAvailableAddress = std::max(NextAvailableAddress,
+                                      Phdr.p_vaddr + Phdr.p_memsz);
+      NextAvailableOffset = std::max(NextAvailableOffset,
+                                     Phdr.p_offset + Phdr.p_filesz);*/
+      //zgq
+      NextAvailableAddress =
+        std::max(NextAvailableAddress,
+             static_cast<uint64_t>(Phdr.p_vaddr) +
+             static_cast<uint64_t>(Phdr.p_memsz));
+
+      NextAvailableOffset =
+        std::max(NextAvailableOffset,
+             static_cast<uint64_t>(Phdr.p_offset) +
+             static_cast<uint64_t>(Phdr.p_filesz));
+      //zgq
+      
+      /*BC->SegmentMapInfo[Phdr.p_vaddr] = SegmentInfo{Phdr.p_vaddr,
+                                                     Phdr.p_memsz,
+                                                     Phdr.p_offset,
+                                                     Phdr.p_filesz,
+                                                     Phdr.p_align};*/
+      //zgq
+      BC->SegmentMapInfo[Phdr.p_vaddr] =
+    SegmentInfo{static_cast<uint64_t>(Phdr.p_vaddr),
+                static_cast<uint64_t>(Phdr.p_memsz),
+                static_cast<uint64_t>(Phdr.p_offset),
+                static_cast<uint64_t>(Phdr.p_filesz),
+                static_cast<uint64_t>(Phdr.p_align)};
+      //zgq
+
+      break;
+    case ELF::PT_INTERP:
+      BC->HasInterpHeader = true;
+      break;
+    }
+  }
+
+  for (const SectionRef &Section : InputFile->sections()) {
+    Expected<StringRef> SectionNameOrErr = Section.getName();
+    if (Error E = SectionNameOrErr.takeError())
+      return E;
+    StringRef SectionName = SectionNameOrErr.get();
+    if (SectionName == ".text") {
+      BC->OldTextSectionAddress = Section.getAddress();
+      BC->OldTextSectionSize = Section.getSize();
+
+      Expected<StringRef> SectionContentsOrErr = Section.getContents();
+      if (Error E = SectionContentsOrErr.takeError())
+        return E;
+      StringRef SectionContents = SectionContentsOrErr.get();
+      BC->OldTextSectionOffset =
+          SectionContents.data() - InputFile->getData().data();
+    }
+
+    if (!opts::HeatmapMode &&
+        !(opts::AggregateOnly && BAT->enabledFor(InputFile)) &&
+        (SectionName.startswith(getOrgSecPrefix()) ||
+         SectionName == getBOLTTextSectionName()))
+      return createStringError(
+          errc::function_not_supported,
+          "BOLT-ERROR: input file was processed by BOLT. Cannot re-optimize");
+  }
+
+  if (!NextAvailableAddress || !NextAvailableOffset)
+    return createStringError(errc::executable_format_error,
+                             "no PT_LOAD pheader seen");
+
+  outs() << "BOLT-INFO: first alloc address is 0x"
+         << Twine::utohexstr(BC->FirstAllocAddress) << '\n';
+
+  FirstNonAllocatableOffset = NextAvailableOffset;
+
+  NextAvailableAddress = alignTo(NextAvailableAddress, BC->PageAlign);
+  NextAvailableOffset = alignTo(NextAvailableOffset, BC->PageAlign);
+
+  // Hugify: Additional huge page from left side due to
+  // weird ASLR mapping addresses (4KB aligned)
+  if (opts::Hugify && !BC->HasFixedLoadAddress)
+    NextAvailableAddress += BC->PageAlign;
+
+  if (!opts::UseGnuStack) {
+    // This is where the black magic happens. Creating PHDR table in a segment
+    // other than that containing ELF header is tricky. Some loaders and/or
+    // parts of loaders will apply e_phoff from ELF header assuming both are in
+    // the same segment, while others will do the proper calculation.
+    // We create the new PHDR table in such a way that both of the methods
+    // of loading and locating the table work. There's a slight file size
+    // overhead because of that.
+    //
+    // NB: bfd's strip command cannot do the above and will corrupt the
+    //     binary during the process of stripping non-allocatable sections.
+    if (NextAvailableOffset <= NextAvailableAddress - BC->FirstAllocAddress)
+      NextAvailableOffset = NextAvailableAddress - BC->FirstAllocAddress;
+    else
+      NextAvailableAddress = NextAvailableOffset + BC->FirstAllocAddress;
+
+    assert(NextAvailableOffset ==
+               NextAvailableAddress - BC->FirstAllocAddress &&
+           "PHDR table address calculation error");
+
+    outs() << "BOLT-INFO: creating new program header table at address 0x"
+           << Twine::utohexstr(NextAvailableAddress) << ", offset 0x"
+           << Twine::utohexstr(NextAvailableOffset) << '\n';
+
+    PHDRTableAddress = NextAvailableAddress;
+    PHDRTableOffset = NextAvailableOffset;
+
+    // Reserve space for 3 extra pheaders.
+    unsigned Phnum = Obj.getHeader().e_phnum;
+    Phnum += 3;
+
+    NextAvailableAddress += Phnum * sizeof(ELF64LEPhdrTy);
+    NextAvailableOffset += Phnum * sizeof(ELF64LEPhdrTy);
+  }
+
+  // Align at cache line.
+  NextAvailableAddress = alignTo(NextAvailableAddress, 64);
+  NextAvailableOffset = alignTo(NextAvailableOffset, 64);
+
+  NewTextSegmentAddress = NextAvailableAddress;
+  NewTextSegmentOffset = NextAvailableOffset;
+  BC->LayoutStartAddress = NextAvailableAddress;
+
+  // Tools such as objcopy can strip section contents but leave header
+  // entries. Check that at least .text is mapped in the file.
+  if (!getFileOffsetForAddress(BC->OldTextSectionAddress))
+    return createStringError(errc::executable_format_error,
+                             "BOLT-ERROR: input binary is not a valid ELF "
+                             "executable as its text section is not "
+                             "mapped to a valid segment");
+  return Error::success();
+}
+//zgq
+
+//zgq
 Error RewriteInstance::discoverStorage() {
+  if (auto *F = dyn_cast<ELF32LEObjectFile>(InputFile))
+    return discoverStorage(F);
+
+  if (auto *F = dyn_cast<ELF64LEObjectFile>(InputFile))
+    return discoverStorage(F);
+
+  return createStringError(errc::not_supported,
+                           "unsupported ELF object format");
+}
+//zgq
+
+/*Error RewriteInstance::discoverStorage() {
   NamedRegionTimer T("discoverStorage", "discover storage", TimerGroupName,
                      TimerGroupDesc, opts::TimeRewrite);
 
@@ -611,7 +878,7 @@ Error RewriteInstance::discoverStorage() {
                              "executable as its text section is not "
                              "mapped to a valid segment");
   return Error::success();
-}
+}//zgq*/
 
 void RewriteInstance::parseBuildID() {
   if (!BuildIDSection)
@@ -3777,7 +4044,144 @@ void RewriteInstance::updateOutputValues(const BOLTLinker &Linker) {
     Function->updateOutputValues(Linker);
 }
 
+//zgq
 void RewriteInstance::patchELFPHDRTable() {
+  if (auto *F = dyn_cast<ELF32LEObjectFile>(InputFile))
+    return patchELFPHDRTableImpl(F);
+
+  if (auto *F = dyn_cast<ELF64LEObjectFile>(InputFile))
+    return patchELFPHDRTableImpl(F);
+
+  llvm_unreachable("unsupported ELF");
+}
+
+template <typename ELFT>
+void RewriteInstance::patchELFPHDRTableImpl(ELFObjectFile<ELFT> *File) {
+  using Elf_Phdr = typename ELFFile<ELFT>::Elf_Phdr;
+
+  const ELFFile<ELFT> &Obj = File->getELFFile();
+  raw_fd_ostream &OS = Out->os();
+
+  Phnum = Obj.getHeader().e_phnum;
+  if (PHDRTableOffset) {
+    Phnum += 1;
+    if (NewWritableSegmentSize)
+      Phnum += 1;
+  } else {
+    assert(!PHDRTableAddress && "unexpected address for program header table");
+    PHDRTableOffset = Obj.getHeader().e_phoff;
+    if (NewWritableSegmentSize) {
+      errs() << "Unable to add writable segment with UseGnuStack option\n";
+      exit(1);
+    }
+  }
+
+  if (!NewWritableSegmentSize) {
+    if (PHDRTableAddress)
+      NewTextSegmentSize = NextAvailableAddress - PHDRTableAddress;
+    else
+      NewTextSegmentSize = NextAvailableAddress - NewTextSegmentAddress;
+  } else {
+    NewWritableSegmentSize = NextAvailableAddress - NewWritableSegmentAddress;
+  }
+
+  OS.seek(PHDRTableOffset);
+
+  bool ModdedGnuStack = false;
+  bool AddedSegment = false;
+
+  auto createNewTextPhdr = [&]() {
+    Elf_Phdr NewPhdr{};
+    NewPhdr.p_type = ELF::PT_LOAD;
+    if (PHDRTableAddress) {
+      NewPhdr.p_offset = PHDRTableOffset;
+      NewPhdr.p_vaddr = PHDRTableAddress;
+      NewPhdr.p_paddr = PHDRTableAddress;
+    } else {
+      NewPhdr.p_offset = NewTextSegmentOffset;
+      NewPhdr.p_vaddr = NewTextSegmentAddress;
+      NewPhdr.p_paddr = NewTextSegmentAddress;
+    }
+    NewPhdr.p_filesz = NewTextSegmentSize;
+    NewPhdr.p_memsz = NewTextSegmentSize;
+    NewPhdr.p_flags = ELF::PF_X | ELF::PF_R;
+    if (opts::Instrument)
+      NewPhdr.p_flags |= ELF::PF_W;
+    NewPhdr.p_align = BC->PageAlign;
+    return NewPhdr;
+  };
+
+  auto createNewWritableSectionsPhdr = [&]() {
+    Elf_Phdr NewPhdr{};
+    NewPhdr.p_type = ELF::PT_LOAD;
+    NewPhdr.p_offset = getFileOffsetForAddress(NewWritableSegmentAddress);
+    NewPhdr.p_vaddr = NewWritableSegmentAddress;
+    NewPhdr.p_paddr = NewWritableSegmentAddress;
+    NewPhdr.p_filesz = NewWritableSegmentSize;
+    NewPhdr.p_memsz = NewWritableSegmentSize;
+    NewPhdr.p_align = BC->RegularPageSize;
+    NewPhdr.p_flags = ELF::PF_R | ELF::PF_W;
+    return NewPhdr;
+  };
+
+  for (const Elf_Phdr &Phdr : cantFail(Obj.program_headers())) {
+    Elf_Phdr NewPhdr = Phdr;
+
+    if (PHDRTableAddress && Phdr.p_type == ELF::PT_PHDR) {
+      NewPhdr.p_offset = PHDRTableOffset;
+      NewPhdr.p_vaddr = PHDRTableAddress;
+      NewPhdr.p_paddr = PHDRTableAddress;
+      NewPhdr.p_filesz = sizeof(NewPhdr) * Phnum;
+      NewPhdr.p_memsz = sizeof(NewPhdr) * Phnum;
+    } else if (Phdr.p_type == ELF::PT_GNU_EH_FRAME) {
+      ErrorOr<BinarySection &> EHFrameHdrSec =
+          BC->getUniqueSectionByName(getNewSecPrefix() + ".eh_frame_hdr");
+      if (EHFrameHdrSec && EHFrameHdrSec->isAllocatable() &&
+          EHFrameHdrSec->isFinalized()) {
+        NewPhdr.p_offset = EHFrameHdrSec->getOutputFileOffset();
+        NewPhdr.p_vaddr = EHFrameHdrSec->getOutputAddress();
+        NewPhdr.p_paddr = EHFrameHdrSec->getOutputAddress();
+        NewPhdr.p_filesz = EHFrameHdrSec->getOutputSize();
+        NewPhdr.p_memsz = EHFrameHdrSec->getOutputSize();
+      }
+    } else if (opts::UseGnuStack && Phdr.p_type == ELF::PT_GNU_STACK) {
+      NewPhdr = createNewTextPhdr();
+      ModdedGnuStack = true;
+    } else if (!opts::UseGnuStack && Phdr.p_type == ELF::PT_DYNAMIC) {
+      Elf_Phdr NewTextPhdr = createNewTextPhdr();
+      OS.write(reinterpret_cast<const char *>(&NewTextPhdr),
+               sizeof(NewTextPhdr));
+
+      if (NewWritableSegmentSize) {
+        Elf_Phdr NewWritablePhdr = createNewWritableSectionsPhdr();
+        OS.write(reinterpret_cast<const char *>(&NewWritablePhdr),
+                 sizeof(NewWritablePhdr));
+      }
+      AddedSegment = true;
+    }
+
+    OS.write(reinterpret_cast<const char *>(&NewPhdr), sizeof(NewPhdr));
+  }
+
+  if (!opts::UseGnuStack && !AddedSegment) {
+    Elf_Phdr NewTextPhdr = createNewTextPhdr();
+    OS.write(reinterpret_cast<const char *>(&NewTextPhdr),
+             sizeof(NewTextPhdr));
+
+    if (NewWritableSegmentSize) {
+      Elf_Phdr NewWritablePhdr = createNewWritableSectionsPhdr();
+      OS.write(reinterpret_cast<const char *>(&NewWritablePhdr),
+               sizeof(NewWritablePhdr));
+    }
+  }
+
+  assert((!opts::UseGnuStack || ModdedGnuStack) &&
+         "could not find GNU_STACK program header to modify");
+}
+//zgq
+
+//zgq
+/*void RewriteInstance::patchELFPHDRTable() {
   auto ELF64LEFile = cast<ELF64LEObjectFile>(InputFile);
   const ELFFile<ELF64LE> &Obj = ELF64LEFile->getELFFile();
   raw_fd_ostream &OS = Out->os();
@@ -3906,7 +4310,7 @@ void RewriteInstance::patchELFPHDRTable() {
 
   assert((!opts::UseGnuStack || ModdedGnuStack) &&
          "could not find GNU_STACK program header to modify");
-}
+}*///zgq
 
 namespace {
 
@@ -3926,7 +4330,7 @@ uint64_t appendPadding(raw_pwrite_stream &OS, uint64_t Offset,
 
 }
 
-void RewriteInstance::rewriteNoteSections() {
+/*void RewriteInstance::rewriteNoteSections() {
   auto ELF64LEFile = cast<ELF64LEObjectFile>(InputFile);
   const ELFFile<ELF64LE> &Obj = ELF64LEFile->getELFFile();
   raw_fd_ostream &OS = Out->os();
@@ -4034,7 +4438,128 @@ void RewriteInstance::rewriteNoteSections() {
     OS.write(Section.getOutputContents().data(), Section.getOutputSize());
     NextAvailableOffset += Section.getOutputSize();
   }
+}*///zgq
+
+//zgq
+void RewriteInstance::rewriteNoteSections() {
+  if (auto *F = dyn_cast<ELF32LEObjectFile>(InputFile))
+    return rewriteNoteSectionsImpl(F);
+
+  if (auto *F = dyn_cast<ELF64LEObjectFile>(InputFile))
+    return rewriteNoteSectionsImpl(F);
+
+  llvm_unreachable("unsupported ELF");
 }
+
+template <typename ELFT>
+void RewriteInstance::rewriteNoteSectionsImpl(ELFObjectFile<ELFT> *File) {
+  const ELFFile<ELFT> &Obj = File->getELFFile();
+  raw_fd_ostream &OS = Out->os();
+
+  uint64_t NextAvailableOffset = getFileOffsetForAddress(NextAvailableAddress);
+  assert(NextAvailableOffset >= FirstNonAllocatableOffset &&
+         "next available offset calculation failure");
+  OS.seek(NextAvailableOffset);
+
+  for (const auto &Section : cantFail(Obj.sections())) {
+    if (Section.sh_type == ELF::SHT_NULL)
+      continue;
+    if (Section.sh_flags & ELF::SHF_ALLOC)
+      continue;
+
+    SectionRef SecRef = File->toSectionRef(&Section);
+    BinarySection *BSec = BC->getSectionForSectionRef(SecRef);
+    assert(BSec && !BSec->isAllocatable() &&
+           "Matching non-allocatable BinarySection should exist.");
+
+    StringRef SectionName =
+        cantFail(Obj.getSectionName(Section), "cannot get section name");
+
+    if (shouldStrip(Section, SectionName))
+      continue;
+
+    NextAvailableOffset =
+        appendPadding(OS, NextAvailableOffset,
+                      static_cast<uint64_t>(Section.sh_addralign));
+
+    uint64_t Size = 0;
+    bool DataWritten = false;
+    uint8_t *SectionData = nullptr;
+
+    if (!willOverwriteSection(SectionName)) {
+      Size = static_cast<uint64_t>(Section.sh_size);
+
+      StringRef Dataref =
+          InputFile->getData().substr(static_cast<uint64_t>(Section.sh_offset),
+                                      Size);
+
+      std::string Data;
+      if (BSec->getPatcher()) {
+        Data = BSec->getPatcher()->patchBinary(Dataref);
+        Dataref = StringRef(Data);
+      }
+
+      if (Size != Dataref.size()) {
+        BSec = &BC->registerOrUpdateNoteSection(
+            SectionName, copyByteArray(Dataref), Dataref.size());
+        Size = 0;
+      } else {
+        OS << Dataref;
+        DataWritten = true;
+
+        Size = appendPadding(OS, Size,
+                             static_cast<uint64_t>(Section.sh_addralign));
+      }
+    }
+
+    assert(BSec->getAlignment() <=
+               static_cast<uint64_t>(Section.sh_addralign) &&
+           "alignment exceeds value in file");
+
+    if (BSec->getAllocAddress()) {
+      assert(!DataWritten && "Writing section twice.");
+      (void)DataWritten;
+
+      SectionData = BSec->getOutputData();
+
+      OS.write(reinterpret_cast<char *>(SectionData), BSec->getOutputSize());
+      Size += BSec->getOutputSize();
+    }
+
+    BSec->setOutputFileOffset(NextAvailableOffset);
+
+    BSec->flushPendingRelocations(OS, [this](const MCSymbol *S) {
+      return getNewValueForSymbol(S->getName());
+    });
+
+    BinarySection &NewSection = BC->registerOrUpdateNoteSection(
+        SectionName, SectionData, Size,
+        static_cast<uint64_t>(Section.sh_addralign),
+        !BSec->isWritable(), BSec->getELFType());
+
+    NewSection.setOutputAddress(0);
+    NewSection.setOutputFileOffset(NextAvailableOffset);
+
+    NextAvailableOffset += Size;
+  }
+
+  for (BinarySection &Section : BC->nonAllocatableSections()) {
+    if (Section.getOutputFileOffset() || !Section.getAllocAddress())
+      continue;
+
+    assert(!Section.hasPendingRelocations() && "cannot have pending relocs");
+
+    NextAvailableOffset =
+        appendPadding(OS, NextAvailableOffset, Section.getAlignment());
+
+    Section.setOutputFileOffset(NextAvailableOffset);
+
+    OS.write(Section.getOutputContents().data(), Section.getOutputSize());
+
+    NextAvailableOffset += Section.getOutputSize();
+  }
+}
+//zgq
 
 template <typename ELFT>
 void RewriteInstance::finalizeSectionStringTable(ELFObjectFile<ELFT> *File) {

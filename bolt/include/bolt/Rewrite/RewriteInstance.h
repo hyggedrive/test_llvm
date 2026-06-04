@@ -223,11 +223,20 @@ private:
   /// (dynamically) read-only (written once), as specified in LSB Chapter 12:
   /// "segment which may be made read-only after relocations have been
   /// processed".
-  void markGnuRelroSections();
+void markGnuRelroSections();
+
+//zgq
+template <typename ELFT>
+void markGnuRelroSectionsImpl(object::ELFObjectFile<ELFT> *File);
+//zgq
 
   /// Detect addresses and offsets available in the binary for allocating
   /// new sections.
-  Error discoverStorage();
+Error discoverStorage();//zgq
+  //zgq
+  template <typename ELFT>
+Error discoverStorage(object::ELFObjectFile<ELFT> *File);
+  //zgq
 
   /// Adjust function sizes and set proper maximum size values after the whole
   /// symbol table has been processed.
@@ -247,7 +256,10 @@ private:
                          uint64_t &ExtractedValue, bool &Skip) const;
 
   /// Rewrite non-allocatable sections with modifications.
-  void rewriteNoteSections();
+void rewriteNoteSections();
+
+template <typename ELFT>
+void rewriteNoteSectionsImpl(object::ELFObjectFile<ELFT> *File);//zgq
 
   /// Write .eh_frame_hdr.
   void writeEHFrameHeader();
@@ -286,8 +298,10 @@ private:
   }
 
   /// Patch ELF book-keeping info.
-  void patchELFPHDRTable();
+void patchELFPHDRTable();
 
+template <typename ELFT>
+void patchELFPHDRTableImpl(object::ELFObjectFile<ELFT> *File);
   /// Create section header table.
   ELF_FUNCTION(void, patchELFSectionHeaderTable);
 
