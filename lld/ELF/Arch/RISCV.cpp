@@ -27,6 +27,212 @@ using namespace lld::elf;
 
 namespace {
 
+static DenseMap<const InputSectionBase *, uint64_t> ZgqDataSecHotness;//zgq
+
+//zgq
+// zgq: candidate used for weighted GP selection.
+struct ZgqGPCandidate {
+  uint64_t addr;
+  uint32_t weight;
+};
+//zgq
+
+//zgq
+
+static void collectGPHotDataSections(Ctx &ctx) {
+  ZgqDataSecHotness.clear();
+
+  for (InputSectionBase *secBase : ctx.inputSections) {
+    auto *sec = dyn_cast<InputSection>(secBase);
+    if (!sec)
+      continue;
+
+    ArrayRef<Relocation> relocs = sec->relocs();
+
+    for (size_t i = 0; i < relocs.size(); ++i) {
+      const Relocation &rel = relocs[i];
+
+      if (rel.type != R_RISCV_HI20)
+        continue;
+
+      if (i + 1 >= relocs.size() || relocs[i + 1].type != R_RISCV_RELAX)
+        continue;
+
+      Symbol *sym = rel.sym;
+      if (!sym)
+        continue;
+
+      auto *d = dyn_cast<Defined>(sym);
+      if (!d || !d->section)
+        continue;
+
+      if (sym->isFunc())
+        continue;
+
+      auto *dataSec = dyn_cast<InputSectionBase>(d->section);
+      if (!dataSec)
+        continue;
+
+      if (!(dataSec->flags & SHF_ALLOC))
+        continue;
+
+      if (dataSec->flags & SHF_EXECINSTR)
+        continue;
+
+      if (dataSec->flags & SHF_MERGE)
+        continue;
+
+      ZgqDataSecHotness[dataSec]++;
+    }
+  }
+}
+//zgq
+
+//zgq
+// zgq: choose a better __global_pointer$ by weighted relocation coverage.
+static void optimizeGP(Ctx &ctx) {
+  Defined *gp = ElfSym::riscvGlobalPointer;
+  if (!gp || !gp->section)
+    return;
+
+  SmallVector<ZgqGPCandidate, 0> candidates;
+
+  // =========================================================
+  // Collect relocation-driven GP candidates.
+  //
+  // We only collect HI20 relocations that are officially relaxable:
+  //   R_RISCV_HI20 + R_RISCV_RELAX
+  //
+  // The symbol must be a safe data symbol.
+  // =========================================================
+  for (InputSectionBase *secBase : ctx.inputSections) {
+    auto *sec = dyn_cast<InputSection>(secBase);
+    if (!sec)
+      continue;
+
+    ArrayRef<Relocation> relocs = sec->relocs();
+
+    for (size_t i = 0; i < relocs.size(); i++) {
+      const Relocation &rel = relocs[i];
+
+      // Must be HI20.
+      if (rel.type != R_RISCV_HI20)
+        continue;
+
+      // Must be followed by R_RISCV_RELAX.
+      if (i + 1 >= relocs.size() || relocs[i + 1].type != R_RISCV_RELAX)
+        continue;
+
+      Symbol *sym = rel.sym;
+      if (!sym)
+        continue;
+
+      auto *d = dyn_cast<Defined>(sym);
+      if (!d)
+        continue;
+
+      if (sym->isFunc())
+        continue;
+
+      if (!d->section)
+        continue;
+
+      // Only allocated data-like sections.
+      if (!(d->section->flags & SHF_ALLOC))
+        continue;
+
+      // Exclude code section.
+      if (d->section->flags & SHF_EXECINSTR)
+        continue;
+
+      // Exclude merge/string sections.
+      if (d->section->flags & SHF_MERGE)
+        continue;
+
+      uint64_t targetVA = sym->getVA(rel.addend);
+
+      // Basic weight:
+      // If this reference becomes GP-relative, usually one 4-byte LUI can be
+      // removed. Later we can refine this according to instruction pattern.
+      uint32_t weight = 4;
+
+      candidates.push_back({targetVA, weight});
+    }
+  }
+
+  if (candidates.empty())
+    return;
+
+  // =========================================================
+  // Sort candidates by address.
+  // =========================================================
+  llvm::sort(candidates, [](const ZgqGPCandidate &a,
+                            const ZgqGPCandidate &b) {
+    if (a.addr != b.addr)
+      return a.addr < b.addr;
+    return a.weight < b.weight;
+  });
+
+  // =========================================================
+  // Weighted sliding window.
+  //
+  // GP-relative offset is signed 12-bit:
+  //   [-2048, +2047]
+  //
+  // Therefore, all covered addresses must fit in a span of 4095 bytes.
+  // =========================================================
+  size_t bestL = 0;
+  size_t bestR = 0;
+  size_t l = 0;
+
+  uint64_t curWeight = 0;
+  uint64_t bestWeight = 0;
+
+  for (size_t r = 0; r < candidates.size(); r++) {
+    curWeight += candidates[r].weight;
+
+    while (candidates[r].addr - candidates[l].addr > 4095) {
+      curWeight -= candidates[l].weight;
+      l++;
+    }
+
+    if (curWeight > bestWeight) {
+      bestWeight = curWeight;
+      bestL = l;
+      bestR = r;
+    }
+  }
+
+  uint64_t minAddr = candidates[bestL].addr;
+  uint64_t maxAddr = candidates[bestR].addr;
+
+  // Legal GP interval:
+  //
+  //   minAddr - gp >= -2048  => gp <= minAddr + 2048
+  //   maxAddr - gp <=  2047  => gp >= maxAddr - 2047
+  //
+  // So:
+  //   gpLow  = maxAddr - 2047
+  //   gpHigh = minAddr + 2048
+  uint64_t gpLow = maxAddr - 2047;
+  uint64_t gpHigh = minAddr + 2048;
+
+  uint64_t bestGP = (gpLow + gpHigh) / 2;
+
+  uint64_t secVA = gp->section->getVA();
+  gp->value = bestGP - secVA;
+
+
+  llvm::errs() << "[ZGQ-GP] candidates=" << candidates.size()
+           << " bestWeight=" << bestWeight
+           << " bestGP=0x" << Twine::utohexstr(bestGP)
+           << " cover=[0x" << Twine::utohexstr(minAddr)
+           << ",0x" << Twine::utohexstr(maxAddr)
+           << "]\n";
+  
+}
+//zgq
+
 class RISCV final : public TargetInfo {
 public:
   RISCV();
@@ -734,8 +940,17 @@ bool RISCV::relaxOnce(int pass) const {
   if (config->relocatable)
     return false;
 
-  if (pass == 0)
+  //zgq
+  if (pass == 0) 
     initSymbolAnchors();
+
+  if(pass == 0){
+  if (config->relaxGP){
+    collectGPHotDataSections(ctx);
+    optimizeGP(ctx);
+  }
+  }
+  //zgq
 
   SmallVector<InputSection *, 0> storage;
   bool changed = false;
