@@ -52,7 +52,7 @@
 #include "llvm/Transforms/Utils/FunctionImportUtils.h"
 #include "llvm/Transforms/Utils/SplitModule.h"
 #include "llvm/Transforms/Utils/SplitModuleCG.h"
-#include <filesystem>
+//#include <filesystem>
 #include <optional>
 
 using namespace llvm;
@@ -141,8 +141,9 @@ Error Config::addSaveTemps(std::string OutputFileName, bool UseInputModulePath,
         return false;
 
       auto extract_filename = [](const std::string &path) -> std::string {
-        std::filesystem::path fs_path(path);
-        return fs_path.filename().string();
+        /*std::filesystem::path fs_path(path);
+        return fs_path.filename().string();*/
+        return llvm::sys::path::filename(path).str();//zgq
       };
 
       std::string PathPrefix;
