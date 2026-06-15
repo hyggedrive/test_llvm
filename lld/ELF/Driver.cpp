@@ -1365,7 +1365,8 @@ static void readConfigs(opt::InputArgList &args) {
   config->printSymbolOrder =
       args.getLastArgValue(OPT_print_symbol_order);
   config->relax = args.hasFlag(OPT_relax, OPT_no_relax, true);
-  config->relaxGP = args.hasFlag(OPT_relax_gp, OPT_no_relax_gp, false);
+  //config->relaxGP = args.hasFlag(OPT_relax_gp, OPT_no_relax_gp, false);
+  config->relaxGP = args.hasFlag(OPT_relax_gp, OPT_no_relax_gp, true);//zgq
   config->rpath = getRpath(args);
   config->relocatable = args.hasArg(OPT_relocatable);
 
