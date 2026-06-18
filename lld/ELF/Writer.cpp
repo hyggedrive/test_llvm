@@ -43,6 +43,230 @@ using namespace lld;
 using namespace lld::elf;
 
 namespace {
+
+// zgq
+static DenseMap<const InputSectionBase *, uint64_t> ZgqDataSecHotness;
+static DenseMap<const Symbol *, uint64_t> ZgqSymbolHotness;
+static uint64_t ZgqTotalGPRelocs = 0;
+
+static bool isZGQGPDataOutputSection(OutputSection *os) {
+  if (!os)
+    return false;
+
+  StringRef name = os->name;
+
+  return name == ".sdata" ||
+         name == ".data" ||
+         name == ".sbss" ||
+         name == ".bss";
+}
+
+static uint64_t getZGQGPHotness(const InputSectionBase *sec) {
+  auto it = ZgqDataSecHotness.find(sec);
+  if (it == ZgqDataSecHotness.end())
+    return 0;
+  return it->second;
+}
+
+static bool compareByZGQGPDensity(const InputSectionBase *a,
+                                  const InputSectionBase *b) {
+  uint64_t ha = getZGQGPHotness(a);
+  uint64_t hb = getZGQGPHotness(b);
+
+  if ((ha != 0) != (hb != 0))
+    return ha != 0;
+
+  uint64_t sa = std::max<uint64_t>(a->getSize(), 1);
+  uint64_t sb = std::max<uint64_t>(b->getSize(), 1);
+
+  // compare ha / sa > hb / sb
+  __uint128_t lhs = (__uint128_t)ha * sb;
+  __uint128_t rhs = (__uint128_t)hb * sa;
+
+  if (lhs != rhs)
+    return lhs > rhs;
+
+  if (ha != hb)
+    return ha > hb;
+
+  if (sa != sb)
+    return sa < sb;
+
+  return false;
+}
+
+static void collectGPHotDataSections(Ctx &ctx) {
+  ZgqDataSecHotness.clear();
+  ZgqSymbolHotness.clear();
+  ZgqTotalGPRelocs = 0;
+
+  for (InputSectionBase *secBase : ctx.inputSections) {
+    auto *sec = dyn_cast<InputSection>(secBase);
+    if (!sec)
+      continue;
+
+    ArrayRef<Relocation> relocs = sec->relocs();
+
+    for (size_t i = 0; i < relocs.size(); ++i) {
+      const Relocation &rel = relocs[i];
+
+      if (rel.type != R_RISCV_HI20)
+        continue;
+
+      if (i + 1 >= relocs.size() || relocs[i + 1].type != R_RISCV_RELAX)
+        continue;
+
+      Symbol *sym = rel.sym;
+      if (!sym)
+        continue;
+
+      auto *d = dyn_cast<Defined>(sym);
+      if (!d || !d->section)
+        continue;
+
+      if (sym->isFunc())
+        continue;
+
+      auto *dataSec = dyn_cast_or_null<InputSectionBase>(d->section);
+      if (!dataSec)
+        continue;
+
+      if (!(dataSec->flags & SHF_ALLOC))
+        continue;
+
+      if (!(dataSec->flags & SHF_WRITE))
+        continue;
+
+      if (dataSec->flags & SHF_EXECINSTR)
+        continue;
+
+      if (dataSec->flags & SHF_MERGE)
+        continue;
+
+      ZgqDataSecHotness[dataSec]++;
+      ZgqSymbolHotness[sym]++;
+      ZgqTotalGPRelocs++;
+    }
+  }
+
+  /*llvm::errs() << "\n========== [ZGQ-GP-HOT-WRITE] summary ==========\n";
+  llvm::errs() << "[ZGQ-GP-HOT-WRITE] total writable gp-relocs = "
+               << ZgqTotalGPRelocs << "\n";
+  llvm::errs() << "[ZGQ-GP-HOT-WRITE] hot writable sections = "
+               << ZgqDataSecHotness.size() << "\n";
+  llvm::errs() << "[ZGQ-GP-HOT-WRITE] hot writable symbols = "
+               << ZgqSymbolHotness.size() << "\n";*/
+
+  SmallVector<std::pair<const InputSectionBase *, uint64_t>, 0> hotSecs;
+  for (auto &it : ZgqDataSecHotness)
+    hotSecs.push_back({it.first, it.second});
+
+  llvm::sort(hotSecs, [](const auto &a, const auto &b) {
+    uint64_t ha = a.second;
+    uint64_t hb = b.second;
+
+    uint64_t sa = std::max<uint64_t>(a.first->getSize(), 1);
+    uint64_t sb = std::max<uint64_t>(b.first->getSize(), 1);
+
+    __uint128_t lhs = (__uint128_t)ha * sb;
+    __uint128_t rhs = (__uint128_t)hb * sa;
+
+    if (lhs != rhs)
+      return lhs > rhs;
+
+    if (ha != hb)
+      return ha > hb;
+
+    return sa < sb;
+  });
+
+  for (auto &it : hotSecs) {
+    const InputSectionBase *sec = it.first;
+    uint64_t hot = it.second;
+    uint64_t size = sec->getSize();
+
+    /*llvm::errs()
+        << "[ZGQ-GP-HOT-WRITE-SEC] "
+        << "sec=" << sec->name
+        << " hotness=" << hot
+        << " size=" << size
+        << " density=";
+
+    if (size == 0)
+      llvm::errs() << "inf";
+    else
+      llvm::errs() << hot << "/" << size;
+
+    llvm::errs() << "\n";*/
+  }
+
+  //llvm::errs() << "========== [ZGQ-GP-HOT-WRITE] end ==========\n\n";
+}
+
+// zgq
+static void sortZGQGPDataInputSections(OutputSection &osec) {
+  /*llvm::errs() << "[ZGQ-GP-ORDER] output section "
+               << osec.name << "\n";*/
+
+  for (SectionCommand *subCmd : osec.commands) {
+    auto *isd = dyn_cast<InputSectionDescription>(subCmd);
+    if (!isd)
+      continue;
+
+    uint64_t hotBefore = 0;
+    for (InputSection *isec : isd->sections)
+      hotBefore += getZGQGPHotness(isec);
+
+    /*llvm::errs() << "[ZGQ-GP-ORDER] before "
+                 << osec.name
+                 << " inputSections="
+                 << isd->sections.size()
+                 << " totalHot="
+                 << hotBefore
+                 << "\n";*/
+
+    llvm::stable_sort(isd->sections, [](InputSection *a, InputSection *b) {
+      if (!a || !b)
+        return false;
+
+      if (!(a->flags & SHF_ALLOC) || !(b->flags & SHF_ALLOC))
+        return false;
+
+      if (!(a->flags & SHF_WRITE) || !(b->flags & SHF_WRITE))
+        return false;
+
+      if ((a->flags & SHF_EXECINSTR) || (b->flags & SHF_EXECINSTR))
+        return false;
+
+      if ((a->flags & SHF_MERGE) || (b->flags & SHF_MERGE))
+        return false;
+
+      return compareByZGQGPDensity(a, b);
+    });
+
+    /*llvm::errs() << "[ZGQ-GP-ORDER] after "
+                 << osec.name
+                 << "\n";*/
+
+    unsigned idx = 0;
+    for (InputSection *isec : isd->sections) {
+      uint64_t hot = getZGQGPHotness(isec);
+      if (hot == 0)
+        continue;
+
+      /*llvm::errs() << "  [ZGQ-GP-ORDER-SEC] idx="
+                   << idx
+                   << " sec=" << isec->name
+                   << " hot=" << hot
+                   << " size=" << isec->getSize()
+                   << "\n";*/
+      idx++;
+    }
+  }
+}
+//zgq
+
+
 // The writer writes a SymbolTable result to a file.
 template <class ELFT> class Writer {
 public:
@@ -1431,16 +1655,43 @@ static void sortSection(OutputSection &osec,
   }
 }
 
-// If no layout was provided by linker script, we want to apply default
+/*// If no layout was provided by linker script, we want to apply default
 // sorting for special input sections. This also handles --symbol-ordering-file.
 template <class ELFT> void Writer<ELFT>::sortInputSections() {
   // Build the order once since it is expensive.
   DenseMap<const InputSectionBase *, int> order = buildSectionOrder();
   maybeShuffle(order);
   for (SectionCommand *cmd : script->sectionCommands)
-    if (auto *osd = dyn_cast<OutputDesc>(cmd))
+    if (auto *osd = dyn_cast<OutputDesc>(cmd)){
       sortSection(osd->osec, order);
+    }
+}//zgq*/
+
+//zgq
+template <class ELFT> void Writer<ELFT>::sortInputSections() {
+  DenseMap<const InputSectionBase *, int> order = buildSectionOrder();
+  maybeShuffle(order);
+
+  // zgq: collect writable GP hot data before section sorting.
+  if (config -> relaxGP) {
+    //llvm::errs() << "[ZGQ-GP] collect before sortInputSections\n";
+    collectGPHotDataSections(ctx);
+  }
+
+  for (SectionCommand *cmd : script->sectionCommands)
+    if (auto *osd = dyn_cast<OutputDesc>(cmd)) {
+      sortSection(osd->osec, order);
+
+      // zgq: after default LLD sorting, apply GP-aware ordering
+      // for writable data output sections only.
+      if (config -> relaxGP && isZGQGPDataOutputSection(&osd->osec)) {
+        /*llvm::errs() << "[ZGQ-GP] reorder output section "
+                     << osd->osec.name << "\n";*/
+        sortZGQGPDataInputSections(osd->osec);
+      }
+    }
 }
+//zgq
 
 template <class ELFT> void Writer<ELFT>::sortSections() {
   llvm::TimeTraceScope timeScope("Sort sections");
