@@ -31,6 +31,7 @@
 #include "llvm/Support/TimeProfiler.h"
 #include "llvm/Support/xxhash.h"
 #include <climits>
+#include <cstdlib>
 
 #define DEBUG_TYPE "lld"
 
@@ -48,6 +49,22 @@ namespace {
 static DenseMap<const InputSectionBase *, uint64_t> ZgqDataSecHotness;
 static DenseMap<const Symbol *, uint64_t> ZgqSymbolHotness;
 static uint64_t ZgqTotalGPRelocs = 0;
+
+static bool zgqGPStatsEnabled() {
+  static bool enabled = [] {
+    const char *s = std::getenv("LLD_RISCV_GP_STATS");
+    return s && s[0] && s[0] != '0';
+  }();
+  return enabled;
+}
+
+static bool zgqDisableDataReorder() {
+  static bool disabled = [] {
+    const char *s = std::getenv("LLD_RISCV_GP_NO_REORDER");
+    return s && s[0] && s[0] != '0';
+  }();
+  return disabled;
+}
 
 static bool isZGQGPDataOutputSection(OutputSection *os) {
   if (!os)
@@ -201,6 +218,12 @@ static void collectGPHotDataSections(Ctx &ctx) {
   }
 
   //llvm::errs() << "========== [ZGQ-GP-HOT-WRITE] end ==========\n\n";
+  if (zgqGPStatsEnabled())
+    llvm::errs() << "[LLD_RISCV_GP_WRITER] hot_writable_gp_relocs="
+                 << ZgqTotalGPRelocs
+                 << " hot_writable_sections=" << ZgqDataSecHotness.size()
+                 << " hot_writable_symbols=" << ZgqSymbolHotness.size()
+                 << "\n";
 }
 
 // zgq
@@ -243,6 +266,16 @@ static void sortZGQGPDataInputSections(OutputSection &osec) {
 
       return compareByZGQGPDensity(a, b);
     });
+
+    if (zgqGPStatsEnabled()) {
+      uint64_t hotAfter = 0;
+      for (InputSection *isec : isd->sections)
+        hotAfter += getZGQGPHotness(isec);
+      llvm::errs() << "[LLD_RISCV_GP_WRITER] reordered_output=" << osec.name
+                   << " input_sections=" << isd->sections.size()
+                   << " hot_refs_before=" << hotBefore
+                   << " hot_refs_after=" << hotAfter << "\n";
+    }
 
     /*llvm::errs() << "[ZGQ-GP-ORDER] after "
                  << osec.name
@@ -1684,7 +1717,8 @@ template <class ELFT> void Writer<ELFT>::sortInputSections() {
 
       // zgq: after default LLD sorting, apply GP-aware ordering
       // for writable data output sections only.
-      if (config -> relaxGP && isZGQGPDataOutputSection(&osd->osec)) {
+      if (config -> relaxGP && !zgqDisableDataReorder() &&
+          isZGQGPDataOutputSection(&osd->osec)) {
         /*llvm::errs() << "[ZGQ-GP] reorder output section "
                      << osd->osec.name << "\n";*/
         sortZGQGPDataInputSections(osd->osec);

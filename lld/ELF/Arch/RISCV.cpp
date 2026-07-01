@@ -17,6 +17,7 @@
 #include "llvm/Support/RISCVAttributes.h"
 #include "llvm/Support/RISCVISAInfo.h"
 #include "llvm/Support/TimeProfiler.h"
+#include <cstdlib>
 
 using namespace llvm;
 using namespace llvm::object;
@@ -79,6 +80,305 @@ struct ZgqGPCandidate {
 };
 //zgq
 
+static bool zgqGPStatsEnabled() {
+  static bool enabled = [] {
+    const char *s = std::getenv("LLD_RISCV_GP_STATS");
+    return s && s[0] && s[0] != '0';
+  }();
+  return enabled;
+}
+
+static bool zgqDisableOptimizeGP() {
+  static bool disabled = [] {
+    const char *s = std::getenv("LLD_RISCV_GP_NO_OPTIMIZE");
+    return s && s[0] && s[0] != '0';
+  }();
+  return disabled;
+}
+
+struct ZgqGPSymStat {
+  const Symbol *sym = nullptr;
+  const InputSectionBase *sec = nullptr;
+  uint64_t refs = 0;
+  uint64_t success = 0;
+  uint64_t fail = 0;
+  uint64_t theoreticalBytes = 0;
+  uint64_t actualBytes = 0;
+};
+
+struct ZgqGPSecStat {
+  const InputSectionBase *sec = nullptr;
+  uint64_t refs = 0;
+  uint64_t success = 0;
+  uint64_t fail = 0;
+  uint64_t dataSymbols = 0;
+  uint64_t hotSymbolBytes = 0;
+  uint64_t hotMin = UINT64_MAX;
+  uint64_t hotMax = 0;
+};
+
+static bool hasRelaxHint(ArrayRef<Relocation> relocs, size_t i) {
+  return i + 1 < relocs.size() && relocs[i + 1].type == R_RISCV_RELAX;
+}
+
+static bool hasMatchingLo12Relax(ArrayRef<Relocation> relocs,
+                                 const Relocation &hi) {
+  for (size_t j = 0, e = relocs.size(); j != e; ++j) {
+    if (relocs[j].sym != hi.sym || relocs[j].addend != hi.addend)
+      continue;
+    if (relocs[j].type != R_RISCV_LO12_I &&
+        relocs[j].type != R_RISCV_LO12_S)
+      continue;
+    if (hasRelaxHint(relocs, j))
+      return true;
+  }
+  return false;
+}
+
+static bool isWritableGPDataOutputSection(const InputSectionBase *sec) {
+  const OutputSection *osec = sec ? sec->getOutputSection() : nullptr;
+  if (!osec)
+    return false;
+  return osec->name == ".sdata" || osec->name == ".data" ||
+         osec->name == ".sbss" || osec->name == ".bss";
+}
+
+static const InputSectionBase *getDefinedInputSection(const Symbol *sym) {
+  auto *d = dyn_cast_or_null<Defined>(sym);
+  return d ? dyn_cast_or_null<InputSectionBase>(d->section) : nullptr;
+}
+
+static bool isSuitableGPSymbol(const Symbol *sym) {
+  auto *d = dyn_cast_or_null<Defined>(sym);
+  if (!d || !d->section || sym->isFunc())
+    return false;
+  uint64_t flags = d->section->flags;
+  return (flags & SHF_ALLOC) && !(flags & SHF_EXECINSTR) &&
+         !(flags & SHF_MERGE);
+}
+
+static void dumpGPDiagnostic(const Twine &tag) {
+  if (!zgqGPStatsEnabled())
+    return;
+
+  const Defined *gp = ElfSym::riscvGlobalPointer;
+  if (!gp) {
+    llvm::errs() << "[LLD_RISCV_GP_STATS] " << tag << ": no gp\n";
+    return;
+  }
+
+  DenseMap<const Symbol *, ZgqGPSymStat> symStats;
+  DenseMap<const InputSectionBase *, ZgqGPSecStat> secStats;
+  DenseSet<const Symbol *> hotSymbols;
+  uint64_t hi20 = 0, hi20WithHint = 0, candidates = 0, success = 0;
+  uint64_t bytesSaved = 0;
+  uint64_t failNoHint = 0, failNoLo12 = 0, failUnsuitable = 0;
+  uint64_t notInReorderScope = 0, failOutOfRange = 0, failOther = 0;
+
+  SmallVector<std::pair<uint64_t, uint64_t>, 0> hotRangesInWindow;
+  const uint64_t gpVA = gp->getVA();
+  const uint64_t winLo = gpVA >= 2048 ? gpVA - 2048 : 0;
+  const uint64_t winHi = gpVA + 2048;
+  uint64_t windowAllocNonExecBytes = 0;
+  uint64_t windowWritableDataBytes = 0;
+
+  for (InputSectionBase *base : ctx.inputSections) {
+    InputSectionBase *isec = base;
+    if (!(isec->flags & SHF_ALLOC) || (isec->flags & SHF_EXECINSTR) ||
+        (isec->flags & SHF_MERGE))
+      continue;
+    uint64_t lo = isec->getVA();
+    uint64_t hi = lo + isec->getSize();
+    if (hi <= winLo || lo >= winHi)
+      continue;
+    uint64_t bytes = std::min(hi, winHi) - std::max(lo, winLo);
+    windowAllocNonExecBytes += bytes;
+    if ((isec->flags & SHF_WRITE) && isWritableGPDataOutputSection(isec))
+      windowWritableDataBytes += bytes;
+  }
+
+  for (InputFile *file : ctx.objectFiles) {
+    for (Symbol *s : file->getSymbols()) {
+      auto *d = dyn_cast_or_null<Defined>(s);
+      auto *sec = d ? dyn_cast_or_null<InputSectionBase>(d->section) : nullptr;
+      if (!sec || s->type != STT_OBJECT || d->size == 0 ||
+          !(sec->flags & SHF_ALLOC) || (sec->flags & SHF_EXECINSTR))
+        continue;
+      ZgqGPSecStat &ss = secStats[sec];
+      ss.sec = sec;
+      ++ss.dataSymbols;
+    }
+  }
+
+  for (InputSectionBase *base : ctx.inputSections) {
+    auto *sec = dyn_cast<InputSection>(base);
+    if (!sec || !(sec->flags & SHF_EXECINSTR))
+      continue;
+    ArrayRef<Relocation> relocs = sec->relocs();
+    const RelaxAux *aux = sec->relaxAux;
+    for (size_t i = 0, e = relocs.size(); i != e; ++i) {
+      const Relocation &r = relocs[i];
+      if (r.type != R_RISCV_HI20)
+        continue;
+      ++hi20;
+
+      const bool hasHint = hasRelaxHint(relocs, i);
+      if (!hasHint) {
+        ++failNoHint;
+        continue;
+      }
+      ++hi20WithHint;
+
+      if (!hasMatchingLo12Relax(relocs, r)) {
+        ++failNoLo12;
+        continue;
+      }
+      if (!isSuitableGPSymbol(r.sym)) {
+        ++failUnsuitable;
+        continue;
+      }
+
+      auto *targetSec = getDefinedInputSection(r.sym);
+      if (!targetSec) {
+        ++failUnsuitable;
+        continue;
+      }
+
+      ++candidates;
+      ZgqGPSymStat &sy = symStats[r.sym];
+      sy.sym = r.sym;
+      sy.sec = targetSec;
+      ++sy.refs;
+      sy.theoreticalBytes += 4;
+      ZgqGPSecStat &se = secStats[targetSec];
+      se.sec = targetSec;
+      ++se.refs;
+
+      auto *d = cast<Defined>(r.sym);
+      const uint64_t symVA = r.sym->getVA(r.addend);
+      if (hotSymbols.insert(r.sym).second) {
+        se.hotMin = std::min(se.hotMin, d->value);
+        se.hotMax = std::max(se.hotMax, d->value + d->size);
+        se.hotSymbolBytes += d->size;
+
+        if (symVA >= winLo && symVA < winHi) {
+          uint64_t symEnd = symVA + std::max<uint64_t>(d->size, 1);
+          hotRangesInWindow.push_back({symVA, std::min(symEnd, winHi)});
+        }
+      }
+
+      const bool inRange = isInt<12>(int64_t(symVA) - int64_t(gpVA));
+      const bool relaxed =
+          aux && aux->relocTypes && aux->relocTypes[i] == R_RISCV_RELAX;
+      if (relaxed) {
+        ++success;
+        bytesSaved += 4;
+        ++sy.success;
+        sy.actualBytes += 4;
+        ++se.success;
+      } else {
+        ++sy.fail;
+        ++se.fail;
+        if (!inRange)
+          ++failOutOfRange;
+        else if (!isWritableGPDataOutputSection(targetSec))
+          ++notInReorderScope;
+        else
+          ++failOther;
+      }
+    }
+  }
+
+  llvm::sort(hotRangesInWindow);
+  uint64_t hotBytesInWindow = 0, curLo = 0, curHi = 0;
+  bool haveRange = false;
+  for (auto [lo, hi] : hotRangesInWindow) {
+    if (!haveRange) {
+      curLo = lo;
+      curHi = hi;
+      haveRange = true;
+      continue;
+    }
+    if (lo <= curHi) {
+      curHi = std::max(curHi, hi);
+    } else {
+      hotBytesInWindow += curHi - curLo;
+      curLo = lo;
+      curHi = hi;
+    }
+  }
+  if (haveRange)
+    hotBytesInWindow += curHi - curLo;
+
+  llvm::errs() << "[LLD_RISCV_GP_STATS] " << tag << "\n";
+  llvm::errs() << "[LLD_RISCV_GP_STATS] gp=0x" << Twine::utohexstr(gpVA)
+               << " window=[0x" << Twine::utohexstr(winLo) << ",0x"
+               << Twine::utohexstr(winHi - 1) << "]\n";
+  llvm::errs() << "[LLD_RISCV_GP_STATS] hi20=" << hi20
+               << " hi20_relax_hint=" << hi20WithHint
+               << " candidates=" << candidates << " gp_success=" << success
+               << " bytes_saved=" << bytesSaved << "\n";
+  llvm::errs() << "[LLD_RISCV_GP_STATS] fail_no_hint=" << failNoHint
+               << " fail_no_lo12=" << failNoLo12
+               << " fail_symbol_unsuitable=" << failUnsuitable
+               << " not_in_reorder_scope=" << notInReorderScope
+               << " fail_gp_out_of_range=" << failOutOfRange
+               << " fail_other=" << failOther << "\n";
+  llvm::errs() << "[LLD_RISCV_GP_STATS] window_alloc_nonexec_bytes="
+               << windowAllocNonExecBytes
+               << " window_writable_data_bytes=" << windowWritableDataBytes
+               << " window_hot_symbol_bytes=" << hotBytesInWindow
+               << " window_cold_or_padding_bytes="
+               << (windowAllocNonExecBytes > hotBytesInWindow
+                       ? windowAllocNonExecBytes - hotBytesInWindow
+                       : 0)
+               << "\n";
+
+  SmallVector<ZgqGPSymStat, 0> syms;
+  for (auto &it : symStats)
+    syms.push_back(it.second);
+  llvm::sort(syms, [](const ZgqGPSymStat &a, const ZgqGPSymStat &b) {
+    if (a.refs != b.refs)
+      return a.refs > b.refs;
+    return a.sym->getName() < b.sym->getName();
+  });
+  for (const ZgqGPSymStat &s : ArrayRef(syms).take_front(64)) {
+    int64_t off = int64_t(s.sym->getVA()) - int64_t(gpVA);
+    llvm::errs() << "[LLD_RISCV_GP_SYM] name=" << s.sym->getName()
+                 << " section=" << (s.sec ? s.sec->name : StringRef("<none>"))
+                 << " section_size=" << (s.sec ? s.sec->getSize() : 0)
+                 << " refs=" << s.refs << " success=" << s.success
+                 << " fail=" << s.fail << " gp_off=" << off
+                 << " theoretical_bytes=" << s.theoreticalBytes
+                 << " actual_bytes=" << s.actualBytes << "\n";
+  }
+
+  SmallVector<ZgqGPSecStat, 0> secs;
+  for (auto &it : secStats)
+    if (it.second.refs || it.second.dataSymbols)
+      secs.push_back(it.second);
+  llvm::sort(secs, [](const ZgqGPSecStat &a, const ZgqGPSecStat &b) {
+    if (a.refs != b.refs)
+      return a.refs > b.refs;
+    return a.sec->name < b.sec->name;
+  });
+  for (const ZgqGPSecStat &s : ArrayRef(secs).take_front(64)) {
+    uint64_t hotSpan = s.hotMin == UINT64_MAX ? 0 : s.hotMax - s.hotMin;
+    uint64_t coldBytes =
+        s.sec->getSize() > s.hotSymbolBytes ? s.sec->getSize() - s.hotSymbolBytes : 0;
+    int64_t off = int64_t(s.sec->getVA()) - int64_t(gpVA);
+    llvm::errs() << "[LLD_RISCV_GP_SEC] section=" << s.sec->name
+                 << " size=" << s.sec->getSize()
+                 << " refs=" << s.refs << " success=" << s.success
+                 << " fail=" << s.fail << " gp_off=" << off
+                 << " data_symbols=" << s.dataSymbols
+                 << " hot_symbol_span=" << hotSpan
+                 << " cold_bytes=" << coldBytes
+                 << " too_large_for_gp_window="
+                 << (s.sec->getSize() > 4096 ? 1 : 0) << "\n";
+  }
+}
+
 //zgq
 // zgq: dump GP relaxation coverage statistics.
 // This must use the same candidate predicate as optimizeGP().
@@ -116,10 +416,12 @@ static void dumpGPRelaxStats(Ctx &ctx, StringRef tag) {
     }
   }
 
-  /*llvm::errs() << "[zgg-gp] " << tag << "\n";
-  llvm::errs() << "[zgg-gp] total candidates = " << totalCandidates << "\n";
-  llvm::errs() << "[zgg-gp] in gp range      = " << inRange << "\n";
-  llvm::errs() << "[zgg-gp] out gp range     = " << outRange << "\n";*/
+  if (zgqGPStatsEnabled()) {
+    llvm::errs() << "[LLD_RISCV_GP_COVERAGE] " << tag << "\n";
+    llvm::errs() << "[LLD_RISCV_GP_COVERAGE] candidates=" << totalCandidates
+                 << " in_gp_range=" << inRange
+                 << " out_gp_range=" << outRange << "\n";
+  }
 }
 //zgq
 
@@ -980,7 +1282,8 @@ bool RISCV::relaxOnce(int pass) const {
   if (config->relaxGP){
     //collectGPHotDataSections(ctx);
     dumpGPRelaxStats(ctx, "before optimizeGP");
-    optimizeGP(ctx);
+    if (!zgqDisableOptimizeGP())
+      optimizeGP(ctx);
     dumpGPRelaxStats(ctx, "after optimizeGP");
   }
   }
@@ -1000,6 +1303,7 @@ bool RISCV::relaxOnce(int pass) const {
 void RISCV::finalizeRelax(int passes) const {
   llvm::TimeTraceScope timeScope("Finalize RISC-V relaxation");
   log("relaxation passes: " + Twine(passes));
+  dumpGPDiagnostic("final");
   SmallVector<InputSection *, 0> storage;
   for (OutputSection *osec : outputSections) {
     if (!(osec->flags & SHF_EXECINSTR))
