@@ -28,6 +28,21 @@ using namespace lld::elf;
 
 namespace {
 
+//zgq jal
+static bool zgqJalRVCStatsEnabled() {
+  static bool enabled = [] {
+    const char *s = std::getenv("LLD_RISCV_JAL_RVC_STATS");
+    return s && s[0] && s[0] != '0';
+  }();
+  return enabled;
+}
+
+static uint64_t ZgqJalRVCRelaxations = 0;
+static uint64_t ZgqJalRVCBytesSaved = 0;
+
+//zgqjal
+
+
 //tongji zgq
 // zgq: Return true if this relocation is a potential GP-related candidate.
 // Keep this predicate shared by dumpGPRelaxStats() and optimizeGP(),
@@ -1135,6 +1150,41 @@ static void relaxCall(const InputSection &sec, size_t i, uint64_t loc,
   }
 }
 
+//zgq jal
+static void relaxJalToRVC(const InputSection &sec, size_t i, uint64_t loc,
+                          Relocation &r, uint32_t &remove) {
+  if (!(config->eflags & EF_RISCV_RVC))
+    return;
+
+  const uint32_t insn = read32le(sec.content().data() + r.offset);
+  const uint32_t rd = extractBits(insn, 11, 7);
+  if (rd != 0 && rd != X_RA)
+    return;
+
+  const uint64_t dest = r.sym->getVA(r.addend);
+  //const int64_t displace = dest - loc;
+  const int64_t displace = int64_t(dest) - int64_t(loc);
+
+  if (!isInt<12>(displace))
+    return;
+
+  if (rd == 0) {
+    sec.relaxAux->relocTypes[i] = R_RISCV_RVC_JUMP;
+    sec.relaxAux->writes.push_back(0xa001); // c.j
+  } else {
+    if (config->is64)
+      return;
+    sec.relaxAux->relocTypes[i] = R_RISCV_RVC_JUMP;
+    sec.relaxAux->writes.push_back(0x2001); // c.jal
+  }
+
+  remove = 2;
+  ++ZgqJalRVCRelaxations;
+  ZgqJalRVCBytesSaved += remove;
+}
+//zgq jal
+
+
 // Relax local-exec TLS when hi20 is zero.
 static void relaxTlsLe(const InputSection &sec, size_t i, uint64_t loc,
                        Relocation &r, uint32_t &remove) {
@@ -1216,6 +1266,11 @@ static bool relax(InputSection &sec) {
           sec.relocs()[i + 1].type == R_RISCV_RELAX)
         relaxCall(sec, i, loc, r, remove);
       break;
+    //zgq jal
+    case R_RISCV_JAL:
+  relaxJalToRVC(sec, i, loc, r, remove);
+  break;
+    //zgq jal
     case R_RISCV_TPREL_HI20:
     case R_RISCV_TPREL_ADD:
     case R_RISCV_TPREL_LO12_I:
@@ -1271,6 +1326,10 @@ static bool relax(InputSection &sec) {
 // relaxation pass.
 bool RISCV::relaxOnce(int pass) const {
   llvm::TimeTraceScope timeScope("RISC-V relaxOnce");
+  //zgq jal
+  ZgqJalRVCRelaxations = 0;
+  ZgqJalRVCBytesSaved = 0;
+  //zgq jal
   if (config->relocatable)
     return false;
 
@@ -1304,6 +1363,12 @@ void RISCV::finalizeRelax(int passes) const {
   llvm::TimeTraceScope timeScope("Finalize RISC-V relaxation");
   log("relaxation passes: " + Twine(passes));
   dumpGPDiagnostic("final");
+  //zgq jal
+  if (zgqGPStatsEnabled() || zgqJalRVCStatsEnabled())
+  llvm::errs() << "[LLD_RISCV_JAL_RVC] relaxed="
+               << ZgqJalRVCRelaxations
+               << " bytes_saved=" << ZgqJalRVCBytesSaved << "\n";
+  //zgq jal
   SmallVector<InputSection *, 0> storage;
   for (OutputSection *osec : outputSections) {
     if (!(osec->flags & SHF_EXECINSTR))
