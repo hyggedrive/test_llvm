@@ -44,57 +44,6 @@ static uint64_t ZgqJalRVCBytesSaved = 0;
 
 
 //tongji zgq
-// zgq: Return true if this relocation is a potential GP-related candidate.
-// Keep this predicate shared by dumpGPRelaxStats() and optimizeGP(),
-// so the statistics and optimization use exactly the same candidate set.
-static bool isZGQGPCandidate(ArrayRef<Relocation> relocs, size_t i) { //input section 里的第 i 条 relocation“能不能放入 GP 候选”
-  const Relocation &rel = relocs[i];
-
-  if (rel.type != R_RISCV_HI20)
-    return false;
-
-  if (i + 1 >= relocs.size() || relocs[i + 1].type != R_RISCV_RELAX)
-    return false;
-
-  Symbol *sym = rel.sym;
-  if (!sym)
-    return false;
-
-  uint64_t targetVA = sym->getVA(rel.addend);
-
-  if (isInt<12>((int64_t)targetVA))
-    return false;
-  
-  auto *d = dyn_cast<Defined>(sym);
-  if (!d || !d->section)
-    return false;
-
-  if (sym->isFunc())
-    return false;
-
-  uint64_t flags = d->section->flags;
-
-  if (!(flags & SHF_ALLOC))
-    return false;
-
-  if (flags & SHF_EXECINSTR)
-    return false;
-
-  if (flags & SHF_MERGE)
-    return false;
-
-  return true;
-}
-//tongji zgq
-
-//zgq
-// zgq: candidate used for weighted GP selection.
-struct ZgqGPCandidate {
-  uint64_t addr;
-  uint64_t weight;
-};
-//zgq
-
 static bool zgqGPStatsEnabled() {
   static bool enabled = [] {
     const char *s = std::getenv("LLD_RISCV_GP_STATS");
@@ -110,6 +59,45 @@ static bool zgqDisableOptimizeGP() {
   }();
   return disabled;
 }
+
+static bool zgqGPCountModelEnabled() {
+  static bool enabled = [] {
+    const char *s = std::getenv("LLD_RISCV_GP_SCORE_MODE");
+    return s && StringRef(s) == "count";
+  }();
+  return enabled;
+}
+
+static bool zgqJalRVCStatsEnabled() {
+  static bool enabled = [] {
+    const char *s = std::getenv("LLD_RISCV_JAL_RVC_STATS");
+    return s && s[0] && s[0] != '0';
+  }();
+  return enabled;
+}
+
+static uint64_t ZgqJalRVCRelaxations = 0;
+static uint64_t ZgqJalRVCBytesSaved = 0;
+static uint64_t ZgqGPHI20Relaxations = 0;
+static uint64_t ZgqGPSavedInst = 0;
+static uint64_t ZgqGPSavedBytes = 0;
+
+struct ZgqGPAddrWeight {
+  uint64_t inst = 0;
+  uint64_t bytes = 0;
+  uint64_t refs = 0;
+  uint64_t textRefs = 0;
+};
+
+struct ZgqGPRef {
+  uint64_t targetVA = 0;
+  bool textRef = false;
+};
+
+struct ZgqGPCandidate {
+  uint64_t addr;
+  ZgqGPAddrWeight weight;
+};
 
 struct ZgqGPSymStat {
   const Symbol *sym = nullptr;
@@ -170,6 +158,32 @@ static bool isSuitableGPSymbol(const Symbol *sym) {
   uint64_t flags = d->section->flags;
   return (flags & SHF_ALLOC) && !(flags & SHF_EXECINSTR) &&
          !(flags & SHF_MERGE);
+}
+
+static bool analyzeZGQGPRef(const InputSection &refSec,
+                            ArrayRef<Relocation> relocs, size_t i,
+                            ZgqGPRef &ref) {
+  const Relocation &rel = relocs[i];
+  if (rel.type != R_RISCV_HI20)
+    return false;
+  if (!hasRelaxHint(relocs, i))
+    return false;
+  if (!rel.sym)
+    return false;
+
+  uint64_t targetVA = rel.sym->getVA(rel.addend);
+  if (isInt<12>(int64_t(targetVA)))
+    return false;
+  if (!hasMatchingLo12Relax(relocs, rel))
+    return false;
+  if (!isSuitableGPSymbol(rel.sym))
+    return false;
+  if (!(refSec.flags & SHF_EXECINSTR))
+    return false;
+
+  ref.targetVA = targetVA;
+  ref.textRef = true;
+  return true;
 }
 
 static void dumpGPDiagnostic(const Twine &tag) {
@@ -414,14 +428,13 @@ static void dumpGPRelaxStats(Ctx &ctx, StringRef tag) {
     ArrayRef<Relocation> relocs = sec->relocs();
 
     for (size_t i = 0; i < relocs.size(); ++i) {
-      if (!isZGQGPCandidate(relocs, i))
+      ZgqGPRef ref;
+      if (!analyzeZGQGPRef(*sec, relocs, i, ref))
         continue;
 
-      const Relocation &rel = relocs[i];
-      uint64_t targetVA = rel.sym->getVA(rel.addend);
       uint64_t gpVA = gp->getVA();
 
-      int64_t off = int64_t(targetVA) - int64_t(gpVA);
+      int64_t off = int64_t(ref.targetVA) - int64_t(gpVA);
 
       ++totalCandidates;
       if (off >= -2048 && off <= 2047)
@@ -447,15 +460,12 @@ static void optimizeGP(Ctx &ctx) {
   if (!gp || !gp->section)
     return;
 
-  // ---------------------------------------------------------
-  // Collect candidates.
-  //
-  // Key: relocation target VA
-  // Val: weight, currently relocation count
-  // ---------------------------------------------------------
-  DenseMap<uint64_t, uint64_t> addrWeight;
+  DenseMap<uint64_t, ZgqGPAddrWeight> addrWeight;
 
   uint64_t rawRelocCount = 0;
+  uint64_t textRefCount = 0;
+  uint64_t totalEstInst = 0;
+  uint64_t totalEstBytes = 0;
 
   for (InputSectionBase *secBase : ctx.inputSections) {
     auto *sec = dyn_cast<InputSection>(secBase);
@@ -465,29 +475,28 @@ static void optimizeGP(Ctx &ctx) {
     ArrayRef<Relocation> relocs = sec->relocs();
 
     for (size_t i = 0; i < relocs.size(); i++) {
-      const Relocation &rel = relocs[i];
-
-      if (!isZGQGPCandidate(relocs, i))
-	  continue;
-      // If you want optimizeGP to only follow writable-data reorder,
-      // enable this filter.
-      //
-      // if (!(flags & SHF_WRITE))
-      //   continue;
-     // const Relocation &rel = relocs[i];
-      Symbol *sym = rel.sym;
-
-      uint64_t targetVA = sym->getVA(rel.addend);
-
-      // x0 path:
-// If target VA itself fits signed 12-bit immediate,
-// relaxHi20Lo12() can relax it via x0, independent of GP.
-// It should not affect GP selection.
-      if (isInt<12>((int64_t)targetVA))
+      ZgqGPRef ref;
+      if (!analyzeZGQGPRef(*sec, relocs, i, ref))
         continue;
 
-      addrWeight[targetVA] += 1;
-      rawRelocCount++;
+      ZgqGPAddrWeight &w = addrWeight[ref.targetVA];
+      ++w.refs;
+      ++rawRelocCount;
+      if (ref.textRef) {
+        ++w.textRefs;
+        ++textRefCount;
+      }
+      if (zgqGPCountModelEnabled()) {
+        ++w.inst;
+        ++w.bytes;
+        ++totalEstInst;
+        ++totalEstBytes;
+      } else {
+        w.inst += 1;
+        w.bytes += 4;
+        totalEstInst += 1;
+        totalEstBytes += 4;
+      }
     }
   }
 
@@ -500,11 +509,8 @@ static void optimizeGP(Ctx &ctx) {
   SmallVector<ZgqGPCandidate, 0> candidates;
   candidates.reserve(addrWeight.size());
 
-  uint64_t totalWeight = 0;
-
   for (auto &it : addrWeight) {
     candidates.push_back({it.first, it.second});
-    totalWeight += it.second;
   }
 
   llvm::sort(candidates, [](const ZgqGPCandidate &a,
@@ -521,22 +527,43 @@ static void optimizeGP(Ctx &ctx) {
   // Therefore the maximum covered address span is:
   //   hi - lo <= 4095
   // ---------------------------------------------------------
-  uint64_t bestWeight = 0;
-  uint64_t curWeight = 0;
+  ZgqGPAddrWeight bestWeight;
+  ZgqGPAddrWeight curWeight;
 
   size_t bestL = 0;
   size_t bestR = 0;
   size_t l = 0;
 
+  auto addWeight = [](ZgqGPAddrWeight &a, const ZgqGPAddrWeight &b) {
+    a.inst += b.inst;
+    a.bytes += b.bytes;
+    a.refs += b.refs;
+    a.textRefs += b.textRefs;
+  };
+  auto subWeight = [](ZgqGPAddrWeight &a, const ZgqGPAddrWeight &b) {
+    a.inst -= b.inst;
+    a.bytes -= b.bytes;
+    a.refs -= b.refs;
+    a.textRefs -= b.textRefs;
+  };
+  auto betterWeight = [](const ZgqGPAddrWeight &a,
+                         const ZgqGPAddrWeight &b) {
+    if (a.inst != b.inst)
+      return a.inst > b.inst;
+    if (a.bytes != b.bytes)
+      return a.bytes > b.bytes;
+    return a.refs > b.refs;
+  };
+
   for (size_t r = 0; r < candidates.size(); r++) {
-    curWeight += candidates[r].weight;
+    addWeight(curWeight, candidates[r].weight);
 
     while (candidates[r].addr - candidates[l].addr > 4095) {
-      curWeight -= candidates[l].weight;
+      subWeight(curWeight, candidates[l].weight);
       l++;
     }
 
-    if (curWeight > bestWeight) {
+    if (betterWeight(curWeight, bestWeight)) {
       bestWeight = curWeight;
       bestL = l;
       bestR = r;
@@ -564,21 +591,22 @@ static void optimizeGP(Ctx &ctx) {
 
   uint64_t bestGP = (minGP + maxGP) / 2;
 
-  uint64_t oldGP = gp->getVA();
-
   uint64_t secVA = gp->section->getVA();
   gp->value = bestGP - secVA;
 
-  /*llvm::errs() << "[ZGQ-GP] rawRelocs=" << rawRelocCount
-         << " uniqueAddrs=" << candidates.size()
-         << " totalWeight=" << totalWeight
-         << " bestWeight=" << bestWeight
-         << " oldGP=0x" << Twine::utohexstr(oldGP)
-         << " newGP=0x" << Twine::utohexstr(bestGP)
-         << " delta=" << (int64_t(bestGP) - int64_t(oldGP))
-         << " cover=[0x" << Twine::utohexstr(lo)
-         << ",0x" << Twine::utohexstr(hi)
-         << "]\n";*/
+  if (zgqGPStatsEnabled()) {
+    llvm::errs() << "[ZGQ-GP-SCORE] mode="
+                 << (zgqGPCountModelEnabled() ? "count" : "inst")
+                 << " unique_addrs=" << candidates.size()
+                 << " raw_refs=" << rawRelocCount
+                 << " text_refs=" << textRefCount
+                 << " total_est_inst=" << totalEstInst
+                 << " total_est_bytes=" << totalEstBytes << "\n";
+    llvm::errs() << "[ZGQ-GP-SCORE] best_inst=" << bestWeight.inst
+                 << " best_bytes=" << bestWeight.bytes
+                 << " best_refs=" << bestWeight.refs
+                 << " selected_gp=0x" << Twine::utohexstr(bestGP) << "\n";
+  }
 }
 //zgq
 
@@ -1150,7 +1178,12 @@ static void relaxCall(const InputSection &sec, size_t i, uint64_t loc,
   }
 }
 
+
 //zgq jal
+
+// Relax a standalone R_RISCV_JAL to c.j or c.jal when the encoded destination
+// register and displacement fit the RVC jump forms.
+
 static void relaxJalToRVC(const InputSection &sec, size_t i, uint64_t loc,
                           Relocation &r, uint32_t &remove) {
   if (!(config->eflags & EF_RISCV_RVC))
@@ -1162,8 +1195,12 @@ static void relaxJalToRVC(const InputSection &sec, size_t i, uint64_t loc,
     return;
 
   const uint64_t dest = r.sym->getVA(r.addend);
+
   //const int64_t displace = dest - loc;
-  const int64_t displace = int64_t(dest) - int64_t(loc);
+  //const int64_t displace = int64_t(dest) - int64_t(loc);
+
+
+  const int64_t displace = dest - loc;
 
   if (!isInt<12>(displace))
     return;
@@ -1173,7 +1210,12 @@ static void relaxJalToRVC(const InputSection &sec, size_t i, uint64_t loc,
     sec.relaxAux->writes.push_back(0xa001); // c.j
   } else {
     if (config->is64)
-      return;
+      //return;
+    //sec.relaxAux->relocTypes[i] = R_RISCV_RVC_JUMP;
+    //sec.relaxAux->writes.push_back(0x2001); // c.jal
+  //}
+
+      return; // c.jal is only available in RV32C.
     sec.relaxAux->relocTypes[i] = R_RISCV_RVC_JUMP;
     sec.relaxAux->writes.push_back(0x2001); // c.jal
   }
@@ -1182,7 +1224,6 @@ static void relaxJalToRVC(const InputSection &sec, size_t i, uint64_t loc,
   ++ZgqJalRVCRelaxations;
   ZgqJalRVCBytesSaved += remove;
 }
-//zgq jal
 
 
 // Relax local-exec TLS when hi20 is zero.
@@ -1228,6 +1269,9 @@ static void relaxHi20Lo12(const InputSection &sec, size_t i, uint64_t loc,
     // Remove lui rd, %hi20(x).
     sec.relaxAux->relocTypes[i] = R_RISCV_RELAX;
     remove = 4;
+    ++ZgqGPHI20Relaxations;
+    ZgqGPSavedInst += 1;
+    ZgqGPSavedBytes += 4;
     break;
   case R_RISCV_LO12_I:
     sec.relaxAux->relocTypes[i] = INTERNAL_R_RISCV_GPREL_I;
@@ -1266,11 +1310,12 @@ static bool relax(InputSection &sec) {
           sec.relocs()[i + 1].type == R_RISCV_RELAX)
         relaxCall(sec, i, loc, r, remove);
       break;
-    //zgq jal
+
+
     case R_RISCV_JAL:
-  relaxJalToRVC(sec, i, loc, r, remove);
-  break;
-    //zgq jal
+      relaxJalToRVC(sec, i, loc, r, remove);
+      break;
+
     case R_RISCV_TPREL_HI20:
     case R_RISCV_TPREL_ADD:
     case R_RISCV_TPREL_LO12_I:
@@ -1333,6 +1378,12 @@ bool RISCV::relaxOnce(int pass) const {
   if (config->relocatable)
     return false;
 
+  ZgqJalRVCRelaxations = 0;
+  ZgqJalRVCBytesSaved = 0;
+  ZgqGPHI20Relaxations = 0;
+  ZgqGPSavedInst = 0;
+  ZgqGPSavedBytes = 0;
+
   //zgq
   if (pass == 0) 
     initSymbolAnchors();
@@ -1363,12 +1414,23 @@ void RISCV::finalizeRelax(int passes) const {
   llvm::TimeTraceScope timeScope("Finalize RISC-V relaxation");
   log("relaxation passes: " + Twine(passes));
   dumpGPDiagnostic("final");
+
   //zgq jal
   if (zgqGPStatsEnabled() || zgqJalRVCStatsEnabled())
   llvm::errs() << "[LLD_RISCV_JAL_RVC] relaxed="
                << ZgqJalRVCRelaxations
                << " bytes_saved=" << ZgqJalRVCBytesSaved << "\n";
   //zgq jal
+
+  if (zgqGPStatsEnabled() || zgqJalRVCStatsEnabled())
+    llvm::errs() << "[LLD_RISCV_JAL_RVC] relaxed="
+                 << ZgqJalRVCRelaxations
+                 << " bytes_saved=" << ZgqJalRVCBytesSaved << "\n";
+  if (zgqGPStatsEnabled())
+    llvm::errs() << "[ZGQ-GP-SAVED-INST] relaxed_hi20="
+                 << ZgqGPHI20Relaxations
+                 << " saved_inst=" << ZgqGPSavedInst
+                 << " saved_bytes=" << ZgqGPSavedBytes << "\n";
   SmallVector<InputSection *, 0> storage;
   for (OutputSection *osec : outputSections) {
     if (!(osec->flags & SHF_EXECINSTR))
